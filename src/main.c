@@ -4,18 +4,15 @@
 // Utiliza Interrupciones, Timer, ADC y PWM.
 //******************************************************************************************//
 
+
 // DEFINICIONES
 // ------------------------------------------------------------------------------------------
 #define F_CPU			16000000UL		//	Define etiqueta Fcpu = 16 MHz (p/c�lc. de retardos).
 #define PWM_FREQ		2000			//	Frecuencia de PWM
 #define TOP_0			250 			//	Valor de precarga para el Timer0 (CTC). Ajustado para una temporizaci�n de 1ms.
 #define BOUNCE_DELAY 	8				//	Delay para Anti-rebote (ms).
+#define DISPLAY_DELAY 	5 				//	ms
 
-// INCLUSI�N DE ARCHIVOS
-// ------------------------------------------------------------------------------------------
-#include <avr/io.h>					//	Contiene definiciones est�ndares (puertos, etc.)
-#include <avr/interrupt.h>			//	Contiene macros para manejo de interrupciones.
-#include <util/delay.h>				//	Contiene macros para generar retardos.
 
 // DEFINICION DE PINES
 // ------------------------------------------------------------------------------------------
@@ -26,8 +23,16 @@
 #define P3      PD2           // Normal: Aapaga el motor. Cnf: Permite salir de este modo. (El el motor debe detener su marcha si se sale o entra en este modo).
 
 //Salidas:
-#define LED_CONFG 	PA6  			//Led de configuracion PA6 ()
-#define LED_NORMAL	PA7 			//Led de funcionamiento normal PA7 ()
+#define LED_NORMAL	PA6 			//Led de funcionamiento normal PA7 (28)
+#define LED_CONFG 	PA7  			//Led de configuracion PA6 (29)
+
+// Pines usados por la librer�a lcd_2560.h:
+#define RS	eS_PORTA0			// Pin RS = PA0 (22) (Reset).
+#define EN	eS_PORTA1			// Pin EN = PA1 (23) (Enable).
+#define D4	eS_PORTA2			// Pin D4 = PA2 (24) (Data D4).
+#define D5	eS_PORTA3			// Pin D5 = PA3 (25) (Data D5).
+#define D6	eS_PORTA4			// Pin D6 = PA4 (26) (Data D6).
+#define D7	eS_PORTA5			// Pin D7 = PA5 (27) (Data D7).
 
 // MARCOS DE USUARIO
 // -------------------------------------------------------------------
@@ -36,6 +41,15 @@
 #define	tbi(p,b)	p ^= _BV(b)					//	tbi(p,b) togglea el bit b de p.
 #define is_high(p,b)	(p & _BV(b)) == _BV(b)	//	is_high(p,b) p/testear si el bit b de p es 1.
 #define is_low(p,b)		(p & _BV(b)) == 0		//	is_low(p,b) p/testear si el bit b de p es 0.
+
+// INCLUSI�N DE ARCHIVOS
+// ------------------------------------------------------------------------------------------
+#include "stdio.h"
+#include "stdlib.h"
+#include <avr/io.h>					//	Contiene definiciones est�ndares (puertos, etc.)
+#include <avr/interrupt.h>			//	Contiene macros para manejo de interrupciones.
+#include <util/delay.h>				//	Contiene macros para generar retardos.
+#include "lcd_2560.h"				// Contiene funciones para manejo del LCD.
 
 // DECLARACI�N DE VARIABLES GLOBALES
 // ------------------------------------------------------------------------------------------
@@ -47,6 +61,14 @@ volatile int engineStatus = 0;			//	Estado del motor
 volatile float dutyCycle = 0;			//	Ciclo util del motor.
 volatile int ignitionTimming = 7000;	//	Tiempo de arranque en ms.
 unsigned int ms_timer = 0;				//	Timmer ms.
+volatile int RV1=0;                     // Lectura del potenciometro RV1 (Tiempo)
+volatile int RV2=0;                     // Lectura del potenciometro RV2 (Velocidad)
+volatile float T = 0;
+volatile float V = 0;
+
+char buffer[16];
+int interface;
+int update;
 
 // Interrupciones externas
 // -------------------------------------------------------------------
@@ -74,15 +96,17 @@ ISR(INT2_vect){
 // DECLARACI�N DE FUNCIONES
 // ------------------------------------------------------------------------------------------
 void configPUERTOS();				//	Funci�n para configurar los puertos.
-void initTimer0();
 void configTIMER0();				//	Funci�n para configurar el Timer0.
 void configTIMER1();				//	Funci�n para configurar el Timer1.
 void initExternalInterrupts();
+void initADConverter();
 int softStart();
 void stopEngine();
 void normal();
 void cnf();
 void lcd();
+void interfaceNormal();
+void interfaceConfig();
 
 // RUT. DE SERVICIO A INTERRUPCIONES
 // ------------------------------------------------------------------------------------------
@@ -94,6 +118,20 @@ ISR(TIMER0_COMPA_vect){
 ISR (TIMER1_OVF_vect){				//	RSI p/desbordam. del Timer1 (cuando llega a TOPE1, esto cada 0,5ms).
 	OCR1B = CUTIL;					//	Carga el valor del ciclo �til seleccionado con las llaves.
 }
+
+ISR(ADC_vect){
+	// Guarda la conversion dependiendo el canal
+	if(!(ADMUX & (1 << MUX0))){
+        RV1 = ADC;                   // ADC0
+    }
+	else{
+        RV2 = ADC;                   // ADC1
+    }
+
+	// Togglea el canal
+    ADMUX ^= (1 << MUX0);
+}
+
 // PROG. PRINCIPAL
 // ------------------------------------------------------------------------------------------
 int main(void){
@@ -101,6 +139,9 @@ int main(void){
 	configTIMER0();					//	Configura Timer0 en modo CTC cada 1ms.
 	configTIMER1();					//	Configura Timer1 en modo Fast PWM (con TOP = OCR1A).
 	initExternalInterrupts();
+	initADConverter();
+	Lcd4_Init();						// Inicializa el LCD (siempre debe estar antes de usar el LCD).
+
 	TIFR0 = 0x00;					//	Borra flags de interrupciones.
 	TIFR1 = 0x00;					//	Borra flags de interrupciones.
 	sei();							//	Habilita las int. globalmente.
@@ -121,10 +162,10 @@ int main(void){
 // FUNCIONES
 // ------------------------------------------------------------------------------------------
 void configPUERTOS()				//	Configura puertos utilizados.
-{	DDRA = 0xFC;					//	PA0 y PA1 entradas, el resto salidas.
+{	DDRA = 0xFF;					//	Puerto configurado como salida.
 	PORTA = 0x00;					//	Inicializa el puerto A.
 	DDRB = 0xFF;					//  Puerto B todo como salida (pin OC1B = PB6).
-	PORTB = 0x00;					//	Inicializa el puerto A.
+	DDRF = 0x00;	   				// Puerto F todo como entrada (para conversor AD)
 
 	// Se configura a PD0, PD1 y PD2 como puertos de entrada con resistencia pull-up internas:
 	PORTD = (1 << P1) | (1 << P2) | (1 << P3);
@@ -157,6 +198,24 @@ void initExternalInterrupts(){
 	EIFR = 0x00;
 }
 
+void initADConverter(){
+	// Desconecta la parte digital del pin ADC0/PF0 y ADC1/PF1.
+	DIDR0 |= ((1 << ADC0D) | (1 << ADC1D));
+
+	// Config. la ref. de tension tomada del pin AVCC (placa Arduino AVCC = Vcc = 5V).
+	// Conversion AD de 10 bits (ADLAR = 0) y con el Multiplexor selecciona canal 0 (ADC0/PF0).
+	ADMUX |= (1 << REFS0);
+
+	// Modo Free Running, ACME=0 y MUX5=0
+	ADCSRB = 0x00;
+
+	// Habilita interrupcion por conversion (ADIE = 1) y prescaler en 128
+	ADCSRA |= ((1 << ADIE) | (1 << ADPS0) | (1 << ADPS1) | (1 << ADPS2));
+
+	// Habilita ADC (ADEN = 1), i
+	ADCSRA |= (1 << ADEN);
+}
+
 // Modo Configuracion
 void cnf(){
 
@@ -166,13 +225,22 @@ void cnf(){
 	//RV2 la velocidad de régimen permanente que alcanzará el motor.
 
 	//Aca tengo que obtener el valor de los potenciometros.
+	T = 5000 + (RV1 * 5000/1023);      	// De 5" a 10"
+	V =  (RV2/1023);          			// De 40% a 95%
 
+	ADCSRA |= (1 << ADIE);                      // Habilita las interrupciones del ADC
+
+	if(interface!=1){
+		update=1;
+		interface=1;
+	}
 }
 
 // Modo normal
 void normal(){
 
-	cbi(PORTA, LED_CONFG);			//Apaga el led de configuracion.
+	ADCSRA &= ~(1 << ADIE);               	// Deshabilita las interrupciones del ADC
+	cbi(PORTA, LED_CONFG);					//Apaga el led de configuracion.
 
 	if(!engineStatus){
 		if(FlagP1){
@@ -184,6 +252,10 @@ void normal(){
 			}
 			FlagP1 = 0;
 		}
+	}
+	if(interface!=0){
+		update=1;
+		interface=0;
 	}
 }
 
@@ -225,5 +297,47 @@ void stopEngine(){
 }
 
 void lcd(){
-	// codigo para mostrar en LCD
+	// interface toma 3 valores durante la ejecucion del main
+	//     * interface = 0 --> Modo normal
+	//     * interface = 1 --> Modo configuracion
+	// Con un switch, se seleccionará qué mostrar en el LCD
+
+	if(update){
+		Lcd4_Clear();
+		switch(interface){
+			case 0:
+				interfaceNormal();
+				break;
+
+			case 1:
+				interfaceConfig();
+				break;
+
+			default:
+				break;
+		}
+		update=0;
+	}
+}
+
+// Mostrar interface Normal en LCD
+void interfaceNormal(){
+	sprintf(buffer, "Encendido: %ds", ignitionTimming);
+	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
+	Lcd4_Write_String(buffer);									// Escribe string
+
+	sprintf(buffer, "Velocidad: %.0f", dutyCycle*100);
+	Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 2, columna 0
+	Lcd4_Write_String(buffer);
+}
+
+// Mostrar interface configuracion etapa 1
+void interfaceConfig(){
+	sprintf(buffer, "CONFIGURACION:");
+	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
+	Lcd4_Write_String(buffer);									// Escribe string
+
+	sprintf(buffer, "T: %.0fs V: %.0f%%", T, V);
+	Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 2, columna 0
+	Lcd4_Write_String(buffer);
 }
