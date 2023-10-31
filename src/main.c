@@ -59,16 +59,24 @@ volatile int FlagP3 = 0;				//	FlagP3 -> NORMAL: Apaga el motor | CNF: Salir de 
 volatile int CUTIL = 0;				    //	Var. global usada para almacenar el ciclo �til seleccionado.
 volatile int engineStatus = 0;			//	Estado del motor
 volatile float dutyCycle = 0;			//	Ciclo util del motor.
-volatile int ignitionTimming = 7000;	//	Tiempo de arranque en ms.
+volatile int ignitionTimming = 0;		//	Tiempo de arranque en ms.
 unsigned int ms_timer = 0;				//	Timmer ms.
+unsigned int currentTime = 0;
 volatile int RV1=0;                     // Lectura del potenciometro RV1 (Tiempo)
 volatile int RV2=0;                     // Lectura del potenciometro RV2 (Velocidad)
 volatile int T = 0;
-volatile int V = 0;
+volatile double V = 0;
+
+
+int CONV_1 = 0;				// Una muestra anterior de la conversi�n AD.
+int CONV_2 = 0;				// Dos muestras anteriores de la conversi�n AD.
+int CONV_3 = 0;				// Tres muestras anteriores de la conversi�n AD.
+int CONV_prom = 0;				// Promedio de 4 muestras.
+volatile int CONV_k = 0;		// Muestra actual de la conversi�n AD.
 
 char buffer[8];
 int interface;
-int update;
+int update = 1;
 
 // Interrupciones externas
 // -------------------------------------------------------------------
@@ -76,19 +84,22 @@ ISR(INT0_vect){
 	_delay_ms(BOUNCE_DELAY);
 	if (is_low(PIND,P2)){        // Comprueba si P2 sigue en BAJO
 		tbi(FlagP2,0);           // Establecer la bandera para indicar la interrupcion
+		update = 1;
+		cbi(FlagP1,0);
 	}
 }
 
 ISR(INT1_vect){
 	_delay_ms(BOUNCE_DELAY);
 	if (is_low(PIND,P1)){        // Comprueba si P1 sigue en BAJO
-		tbi(FlagP1,0);           // Establecer la bandera para indicar la interrupcion
+		sbi(FlagP1,0);           // Establecer la bandera para indicar la interrupcion
+		FlagP3 = 0;
 	}
 }
 
 ISR(INT2_vect){
 	_delay_ms(BOUNCE_DELAY);
-	if (is_low(PIND,P3) && FlagP2){    // Comprueba si P3 sigue en BAJO y está en cnf()
+	if (is_low(PIND,P3)){    // Comprueba si P3 sigue en BAJO y está en cnf()
 		tbi(FlagP3,0);                 // Establecer la bandera para indicar la interrupcion
 	}
 }
@@ -108,12 +119,14 @@ void cnf();
 void lcd();
 void interfaceNormal();
 void interfaceConfig();
+void convertAD();
+void calcAD();
 
 // RUT. DE SERVICIO A INTERRUPCIONES
 // ------------------------------------------------------------------------------------------
 
 ISR(TIMER0_COMPA_vect){
-    ms_timer++;					       // Incrementa contador cada 1ms
+    ms_timer++;				       // Incrementa contador cada 1ms
 }
 
 ISR (TIMER1_OVF_vect){				//	RSI p/desbordam. del Timer1 (cuando llega a TOPE1, esto cada 0,5ms).
@@ -151,14 +164,14 @@ int main(void){
 
 	boot();
 	while(1){
-		if(FlagP2){
+		if(!FlagP2){
 			stopEngine();
 			cnf();
 		}
 		else{
 			normal();
 		}
-		lcd();
+		//lcd();
 	}
 
 }
@@ -183,11 +196,10 @@ void configTIMER0(){
 //	Config. Timer1 como Fast PWM -> Fpwm = 16MHz/[N*(TOPE1 + 1)] = 2kHz.
 void configTIMER1(){
 	TCCR1A |= (1<<WGM11) | (1<<WGM10) | (1<<COM1A1) | (1<<COM1B1) | (1<<COM1C1);
-	//TCCR1A = 0x23;					//	WGM1[3:0]= 1111 modo Fast PWM con TOP1 = OCR1A,
+									//	WGM1[3:0]= 1111 modo Fast PWM con TOP1 = OCR1A,
 									//  OJO!! Con esta config. el pin OC1A no funciona como PWM,
 									//  usar pin OC1B = PB6 o pin OC1C = PB7.
 	TCCR1B |= (1<<WGM12) | (1<<WGM13) | (1<<CS10);
-	//TCCR1B = 0x19;					//	COM1B[1:0]= 10 pin OC1B = PB6  PWM no invertido,
 	TCCR1C = 0x00;					//	CS1[2:0]= 001 div. por N = 1 e inicia el TC1.
 	OCR1A = (F_CPU/(PWM_FREQ))-1;	//	Carga el valor corresp. al periodo pwm.
 	OCR1B = 0x00;					//	OCR1B contiene el ancho de pulso (4000 -> CU = 50% p/inicializar).
@@ -210,13 +222,12 @@ void initADConverter(){
 	ADMUX |= (1 << REFS0);
 
 	// Modo Free Running, ACME=0 y MUX5=0
-	//ADCSRB = 0x00;
-	ADCSRB |= (1<<ACME);
+	ADCSRB = 0x00;
 
 	// Habilita interrupcion por conversion (ADIE = 1) y prescaler en 128
 	ADCSRA |= ((1 << ADIE) | (1 << ADPS0) | (1 << ADPS1) | (1 << ADPS2));
 
-	// Habilita ADC (ADEN = 1), i
+	// Habilita ADC (ADEN = 1)
 	ADCSRA |= (1 << ADEN);
 }
 
@@ -243,143 +254,186 @@ void cnf(){
 
 	sbi(PORTA, LED_CONFG);			//Enciende el led de configuracion.
 
+	ADCSRA |= (1 << ADSC);			//Se inicia la conversion.
+
+	T = (50 + (int)(RV1*(50/1023.0)))*100;      	// De 5" a 10"
+	V =  (RV2/1023.0);
+
+	if(update){
+		sprintf(buffer, "  MODO  ");
+		Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
+		Lcd4_Write_String(buffer);
+
+		sprintf(buffer, " CONFIG ");
+		Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+		Lcd4_Write_String(buffer);									// Escribe string
+		_delay_ms(2000);
+		Lcd4_Clear();
+
+		update = 0;
+	}
+
 	//RV1 ajusta el tiempo de duración del arranque suave.
-	//RV2 la velocidad de régimen permanente que alcanzará el motor.
+	//RV2 la velocidad de régimen permanente que alcanzará el motor.									// Posiciona cursor en fila 1, columna 0
 
-	//Aca tengo que obtener el valor de los potenciometros.
-	T = 5000 + (RV1*(5000/1023));      	// De 5" a 10"
-	V =  (RV2/1023);          			// De 40% a 95%
+	if(ms_timer - currentTime == 100){
+		Lcd4_Clear();
+		currentTime = ms_timer;
+	}
 
-	ADCSRA |= (1 << ADIE);                      // Habilita las interrupciones del ADC
-
-	if(interface!=1){
-		update=1;
-		interface=1;
+	if(FlagP3){
+		Lcd4_Set_Cursor(1,0);
+		sprintf(buffer, "CONFIG T");
+		Lcd4_Write_String(buffer);
+		Lcd4_Set_Cursor(2,0);
+		sprintf(buffer, " %dms ", T);
+		Lcd4_Write_String(buffer);
+	}else{
+		Lcd4_Set_Cursor(1,0);
+		sprintf(buffer, "CONFIG V");
+		Lcd4_Write_String(buffer);
+		Lcd4_Set_Cursor(2,0);
+		sprintf(buffer, "  %0.1f%% ", (V*100));
+		Lcd4_Write_String(buffer);
 	}
 }
 
 // Modo normal
 void normal(){
 
-	ADCSRA &= ~(1 << ADIE);               	// Deshabilita las interrupciones del ADC
 	cbi(PORTA, LED_CONFG);					//Apaga el led de configuracion.
 
+	if(update){
+		sbi(PORTA, LED_NORMAL);
+		sprintf(buffer, "  MODO  ");
+		Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
+		Lcd4_Write_String(buffer);
+
+		sprintf(buffer, " NORMAL ");
+		Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+		Lcd4_Write_String(buffer);									// Escribe string
+		_delay_ms(2000);
+		Lcd4_Clear();
+		cbi(PORTA, LED_NORMAL);
+	}
+
 	if(!engineStatus){
+
+		if(update){
+			Lcd4_Clear();
+			sprintf(buffer, " Listo");
+			Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
+			Lcd4_Write_String(buffer);
+			update = 0;
+		}
+
 		if(FlagP1){
 			//Arranque suave con T y V.
-			if(softStart()){
-				//El motor arranco normalmente.
+			if(softStart()==1){
+				Lcd4_Clear();
+				Lcd4_Set_Cursor(1,0);
+				sprintf(buffer, "ARRANQUE");
+				Lcd4_Write_String(buffer);
+				Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+				sprintf(buffer, "EXITOSO");
+				Lcd4_Write_String(buffer);
+				_delay_ms(1500);
 			}else{
-				//Se presiono P2 o P3
+				for(int i=0; i<3;i++){
+					Lcd4_Clear();
+					_delay_ms(500);
+					Lcd4_Set_Cursor(1,0);
+					sprintf(buffer, "ARRANQUE");
+					Lcd4_Write_String(buffer);
+					Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+					sprintf(buffer, "DETENIDO");
+					Lcd4_Write_String(buffer);
+					_delay_ms(600);
+				}
 			}
 			FlagP1 = 0;
 		}
+	}else{
+		if(update){
+			Lcd4_Clear();
+			Lcd4_Set_Cursor(1,0);
+			sprintf(buffer, "Marcha");
+			Lcd4_Write_String(buffer);
+			Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+			sprintf(buffer, " V: %d%%", (int)(dutyCycle*100));
+			Lcd4_Write_String(buffer);
+			update = 0;
+		}
 	}
-	if(interface!=0){
-		update=1;
-		interface=0;
+
+	if(FlagP3){
+		stopEngine();
+		Lcd4_Clear();
+		Lcd4_Set_Cursor(1,0);
+		sprintf(buffer, " Motor");
+		Lcd4_Write_String(buffer);
+		Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+		sprintf(buffer, "APAGADO");
+		Lcd4_Write_String(buffer);
+		_delay_ms(2000);
+		update = 1;
+		FlagP3 = 0;
 	}
 }
 
 int softStart(){
-	float duty_max = 0.90;
+	ignitionTimming = T;
+	double duty_max = V;
 	float step = 100;
 	float delta_CU = duty_max/step;
 
 	int delta_time = ignitionTimming/step;
 	int current_time = 0;
+	//int LCD_increment = ignitionTimming/8;
+	//int i=0;
 
 	ms_timer = 0;
 	dutyCycle = 0;
 
-	//Timer aumenta 1 cada 10ms
+	Lcd4_Clear();
+	sprintf(buffer, "ARRANQUE");
+	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
+	Lcd4_Write_String(buffer);
+
+	TCCR1A |= (1<<COM1A1) | (1<<COM1B1) | (1<<COM1C1);
+	// Seleccion de la señal del reloj (N=64)
+	TCCR1B |= (1<<CS10);
+
+	//ms_timer aumenta cada 1ms
 	while (ms_timer<=ignitionTimming){
 
 		sbi(PORTA, LED_NORMAL);
 		if(ms_timer - current_time >= delta_time){
 			dutyCycle = dutyCycle + delta_CU;
 			current_time = ms_timer;
+			sprintf(buffer, " %ds %0.0f%%", ((ignitionTimming - ms_timer)/1000), dutyCycle*100);
+			Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
+			Lcd4_Write_String(buffer);
 		}
 		CUTIL = OCR1A*(dutyCycle);
 
-		if(FlagP2 || FlagP3){
+		if(!FlagP2 || FlagP3){
 			stopEngine();
-			break;
+			cbi(PORTA, LED_NORMAL);
 			return 0;
 		}
 	}
 	cbi(PORTA, LED_NORMAL);
 	engineStatus = 1;
+	update = 1;
 	return 1;
 }
 
 void stopEngine(){
 	CUTIL = 0;
+	TCCR1A &= ~((1<<COM1A1) | (1<<COM1B1) | (1<<COM1C1));
+	// Prescaler = 0
+	TCCR1B &= ~((1<<CS10));
+	TCNT1 = 0;
 	engineStatus = 0;
-}
-
-void lcd(){
-	// interface toma 3 valores durante la ejecucion del main
-	//     * interface = 0 --> Modo normal
-	//     * interface = 1 --> Modo configuracion
-	// Con un switch, se seleccionará qué mostrar en el LCD
-
-	if(update){
-		Lcd4_Clear();
-		switch(interface){
-			case 0:
-				interfaceNormal();
-				break;
-
-			case 1:
-				interfaceConfig();
-				break;
-
-			default:
-				break;
-		}
-		update=0;
-	}
-}
-
-// Mostrar interface Normal en LCD
-void interfaceNormal(){
-	sprintf(buffer, "  MODO  ");
-	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
-	Lcd4_Write_String(buffer);
-
-	sprintf(buffer, " NORMAL ");
-	Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
-	Lcd4_Write_String(buffer);									// Escribe string
-
-	_delay_ms(2000);
-	Lcd4_Clear();
-	sprintf(buffer, "T: %ds", ignitionTimming/1000);
-	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
-	Lcd4_Write_String(buffer);									// Escribe string
-
-	sprintf(buffer, "V: %d%%", (int) dutyCycle*100);
-	Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 2, columna 0
-	Lcd4_Write_String(buffer);
-}
-
-// Mostrar interface configuracion etapa 1
-void interfaceConfig(){
-	sprintf(buffer, "  MODO  ");
-	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
-	Lcd4_Write_String(buffer);
-
-	sprintf(buffer, " CONFIG ");
-	Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 1, columna 0
-	Lcd4_Write_String(buffer);									// Escribe string
-
-	_delay_ms(2000);
-	Lcd4_Clear();
-
-	sprintf(buffer, "CONFIG");
-	Lcd4_Set_Cursor(1,0);										// Posiciona cursor en fila 1, columna 0
-	Lcd4_Write_String(buffer);
-	sprintf(buffer, "T: %ds V: %d%%", T, V*100);
-	Lcd4_Set_Cursor(2,0);										// Posiciona cursor en fila 2, columna 0
-	Lcd4_Write_String(buffer);
 }
